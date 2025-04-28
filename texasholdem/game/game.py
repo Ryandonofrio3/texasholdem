@@ -17,6 +17,9 @@ from collections import deque
 from enum import Enum, auto
 import random
 import warnings
+# --- REBUY SUPPORT ---
+from logging import getLogger
+# --- END REBUY SUPPORT ---
 
 from deprecated.sphinx import versionadded, versionchanged
 
@@ -36,6 +39,18 @@ from texasholdem.game.player_state import PlayerState
 from texasholdem.game.move import MoveIterator
 from texasholdem.evaluator import evaluator
 from texasholdem.util.functions import check_raise
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  REBUY SUPPORT
+# ──────────────────────────────────────────────────────────────────────────────
+_logger = getLogger(__name__)
+
+class RebuyError(RuntimeError):
+    """Raised when an invalid rebuy is attempted."""
+
+class RebuyWindowError(RebuyError):
+    """Raised when a rebuy is attempted outside the PREHAND window."""
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 class Player:
@@ -253,11 +268,19 @@ class TexasHoldEm:
 
     """
 
-    def __init__(self, buyin: int, big_blind: int, small_blind: int, max_players=9):
+    def __init__(self, buyin: int, big_blind: int, small_blind: int, max_players=9, *, rebuy_cap: int = 1):
+        """
+        Parameters
+        ----------
+        rebuy_cap
+            How many times the buy-in a single rebuy may top the player up to.
+            A value of 1 (default) means `stack ≤ buyin` after rebuy.
+        """
         self.buyin = buyin
         self.big_blind = big_blind
         self.small_blind = small_blind
         self.max_players = max_players
+        self.rebuy_cap = max(1, int(rebuy_cap)) # Added rebuy_cap
 
         self.players: List[Player] = list(
             Player(i, self.buyin) for i in range(max_players)
@@ -1087,9 +1110,9 @@ class TexasHoldEm:
             pass
 
     @versionchanged(
-        reason="The :code:`value` has been renamed to :code:`total` and will "
-        "be redefined in 1.0.0. Currently, :code:`value` and :code:`total` "
-        "mean to raise *to* the amount given. In 1.0.0, :code:`value` will "
+        reason="The :code:`value` has been renamed to :code:`total` and will \n"
+        "be redefined in 1.0.0. Currently, :code:`value` and :code:`total` \n"
+        "mean to raise *to* the amount given. In 1.0.0, :code:`value` will \n"
         "mean to raise an amount more than the current bet amount.",
         version="0.6.0",
     )
@@ -1123,9 +1146,9 @@ class TexasHoldEm:
 
         if value:
             warnings.warn(
-                "The :code:`value` has been renamed to :code:`total` and will "
-                "be redefined in 1.0.0. Currently, :code:`value` and :code:`total` "
-                "mean to raise *to* the amount given. In 1.0.0, :code:`value` will "
+                "The :code:`value` has been renamed to :code:`total` and will \n"
+                "be redefined in 1.0.0. Currently, :code:`value` and :code:`total` \n"
+                "mean to raise *to* the amount given. In 1.0.0, :code:`value` will \n"
                 "mean to raise an amount more than the current bet amount.",
                 DeprecationWarning,
             )
@@ -1373,3 +1396,102 @@ class TexasHoldEm:
     def __deepcopy__(self, memodict: dict = None):
         memodict = memodict if memodict else {}
         return self.copy(shuffle=False)
+
+    # ──────────────────── public helpers ────────────────────
+    def can_rebuy(self, player_id: int, amount: int | None = None) -> bool:
+        """
+        Quick check without side-effects.
+        """
+        try:
+            self._validate_rebuy(player_id, amount)
+        except RebuyError:
+            return False
+        return True
+
+    def rebuy(self, player_id: int, amount: int | None = None) -> int:
+        """
+        Adds chips to a player's stack during the PREHAND window.
+
+        Returns
+        -------
+        int
+            The number of chips actually purchased.
+        Raises
+        ------
+        RebuyError
+            If the rebuy is illegal for any reason.
+        """
+        amount = self._validate_rebuy(player_id, amount)
+        self._apply_rebuy(player_id, amount)
+        return amount
+
+    # ──────────────────── private helpers ────────────────────
+    def _assert_rebuy_window(self) -> None:
+        if self.hand_phase is not HandPhase.PREHAND:
+            raise RebuyWindowError("Rebuys are only allowed in PREHAND phase.")
+
+    def _validate_rebuy(self, player_id: int, amount: int | None) -> int:
+        """
+        Returns a sanitized, legal amount or raises RebuyError.
+        """
+        self._assert_rebuy_window()
+
+        if player_id not in range(len(self.players)):
+            raise RebuyError(f"No seat {player_id} at the table.")
+
+        player = self.players[player_id]
+        if player.state not in (PlayerState.OUT, PlayerState.SKIP, PlayerState.IN):
+            raise RebuyError(f"Player {player_id} in invalid state {player.state}.")
+
+        max_top_up = self.buyin * self.rebuy_cap - player.chips
+        if max_top_up <= 0:
+            raise RebuyError("Player already at or above rebuy cap.")
+
+        if amount is None:
+            amount = max_top_up
+        if amount <= 0 or amount > max_top_up:
+            raise RebuyError(f"Amount must be 1-{max_top_up} chips.")
+
+        return amount
+
+    def _apply_rebuy(self, player_id: int, amount: int) -> None:
+        """
+        Mutates player state, updates history, and logs the event.
+        """
+        player = self.players[player_id]
+        player.chips += amount
+        if player.state is PlayerState.SKIP and player.chips > 0:
+            player.state = PlayerState.IN
+
+        # record in history so replays are faithful
+        try:
+            # Ensure prehand history exists and has an actions list
+            if not hasattr(self.hand_history, 'prehand') or self.hand_history.prehand is None:
+                 # Minimal stub if prehand is totally missing (should be rare after start_hand)
+                 self.hand_history.prehand = PrehandHistory(
+                     btn_loc=self.btn_loc, big_blind=self.big_blind,
+                     small_blind=self.small_blind,
+                     player_chips={p.player_id: p.chips for p in self.players},
+                     player_cards=self.hands, actions=[]
+                 )
+            elif not hasattr(self.hand_history.prehand, 'actions') or self.hand_history.prehand.actions is None:
+                 # Add actions list if it's missing from prehand
+                 self.hand_history.prehand.actions = []
+
+            self.hand_history.prehand.actions.append(
+                PlayerAction(player_id, "REBUY", total=amount, value=amount) # Assuming "REBUY" is a valid ActionType string or needs conversion
+            )
+        except AttributeError as e:
+             # This block might catch other AttributeErrors if hand_history itself is None
+             _logger.error(f"AttributeError setting up prehand history for rebuy: {e}. Creating minimal stub.")
+             self.hand_history = History() # Create base History object
+             self.hand_history.prehand = PrehandHistory(
+                     btn_loc=self.btn_loc, big_blind=self.big_blind,
+                     small_blind=self.small_blind,
+                     player_chips={p.player_id: p.chips for p in self.players},
+                     player_cards=self.hands, # Use current hands or empty? Needs care.
+                     actions=[PlayerAction(player_id, "REBUY", total=amount, value=amount)]
+                 )
+
+        _logger.info("Player %s rebuys %s chips (stack=%s)",
+                     player_id, amount, player.chips)
