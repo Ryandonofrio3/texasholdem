@@ -11,7 +11,7 @@ Texas Hold Em Notation Conventions:
 """
 from __future__ import annotations
 from typing import Optional, Union, Tuple, List, Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import os
 
@@ -61,6 +61,10 @@ class PrehandHistory:
     player_cards: Dict[int, List[Card]]
     """
     The cards for each player
+    """
+    actions: List[PlayerAction] = field(default_factory=list)
+    """
+    List of pre-hand actions (e.g., REBUY)
     """
 
     def to_string(self, canon_ids: Dict[int, int]) -> str:
